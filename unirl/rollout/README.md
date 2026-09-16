@@ -148,6 +148,11 @@ change surface:
   The horizon must count **accepted deliveries, not pulls**: a group rejected on get is recycled
   and never delivered, so spending its allowance would strand the recycled prompt with nothing
   left to re-admit it and hang the consumer inside `next_group`.
+- **`GroupBuffer` books the acceptance, not the consumer** — it increments in the same event-loop
+  turn as the pop, under the condition lock, so `outstanding + accepted` never dips. Booking it in
+  `Producer.next_group` instead leaves a scheduling gap between the pop and the increment, and the
+  producer wakes inside that gap, sees the smaller buffer against the stale count, and admits a
+  replacement for a group it actually kept — over-admitting past the boundary.
 - **Only the producer coroutine may await `_inflight`** — `pause()` waits on an idle
   event the producer sets, because two coroutines awaiting the same task set would each
   put the same finished group.

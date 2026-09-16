@@ -32,6 +32,7 @@ class GroupBuffer:
         self._recycle = recycle
         self._entries: List[BufferEntry] = []
         self._condition = asyncio.Condition()
+        self._accepted = 0
         self._dropped = 0
         self._recycled = 0
 
@@ -51,10 +52,20 @@ class GroupBuffer:
                 while not self._entries:
                     await self._condition.wait()
                 entry = self._entries.pop(0)
-                # Nothing awaits between the pop and the return, so a cancelled get cannot lose a group.
+                # Nothing awaits between the pop and the return, so a cancelled get cannot lose a
+                # group and an acceptance is booked in the same turn the entry leaves the buffer.
                 if self._get_filter(entry.group, current_version) is Disposition.KEEP:
+                    self._accepted += 1
                     return entry.group
                 self._dispose(Disposition.RECYCLE, entry)
+
+    @property
+    def accepted(self) -> int:
+        """Groups delivered since the last :meth:`reset_accepted`, counted atomically with the pop."""
+        return self._accepted
+
+    def reset_accepted(self) -> None:
+        self._accepted = 0
 
     def _dispose(self, verdict: Disposition, entry: BufferEntry) -> None:
         if verdict is Disposition.RECYCLE and self._recycle is not None:

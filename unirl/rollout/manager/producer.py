@@ -38,7 +38,6 @@ class Producer:
             raise ValueError(f"fanout must be positive; got {fanout}")
         self._budget = 0
         self._horizon = 0
-        self._accepted = 0
         self._inflight: Set[asyncio.Task] = set()
         self._pending: Set[Any] = set()
         self._resumed = asyncio.Event()
@@ -56,7 +55,7 @@ class Producer:
         """Set the occupancy cap and the delivery horizon for this batch; see the rollout README."""
         self._budget = max(0, int(max_outstanding))
         self._horizon = max(0, int(remaining_prompts))
-        self._accepted = 0
+        self._buffer.reset_accepted()
 
     @property
     def inflight(self) -> int:
@@ -71,9 +70,9 @@ class Producer:
                 self._idle.clear()
             while self._resumed.is_set():
                 outstanding = len(self._inflight) + len(self._buffer)
-                # The horizon counts accepted deliveries, so a rejected group frees its own
-                # allowance and its replacement can still be admitted.
-                if outstanding >= self._budget or outstanding + self._accepted >= self._horizon:
+                # The horizon counts accepted deliveries, booked by the buffer in the same turn as
+                # the pop, so this sum never dips while a kept group is in flight to the consumer.
+                if outstanding >= self._budget or outstanding + self._buffer.accepted >= self._horizon:
                     break
                 prompt = self._pull()
                 if prompt is None:
@@ -116,9 +115,7 @@ class Producer:
                     self._task.result()
                     raise RuntimeError("rollout producer exited without an exception")
                 if get in done:
-                    group = get.result()
-                    self._accepted += 1
-                    return group
+                    return get.result()
                 logger.warning("no completed rollout group for %ss", _NO_PROGRESS_WARN_S)
         finally:
             if not get.done():
