@@ -37,7 +37,8 @@ class Producer:
         if self._fanout <= 0:
             raise ValueError(f"fanout must be positive; got {fanout}")
         self._budget = 0
-        self._credit = 0
+        self._horizon = 0
+        self._accepted = 0
         self._inflight: Set[asyncio.Task] = set()
         self._pending: Set[Any] = set()
         self._resumed = asyncio.Event()
@@ -52,9 +53,10 @@ class Producer:
         self._task = asyncio.create_task(self._run(), name="rollout-producer")
 
     async def set_admission(self, *, max_outstanding: int, remaining_prompts: int) -> None:
-        """Set the occupancy cap and recompute the admission credit; see the rollout README."""
+        """Set the occupancy cap and the delivery horizon for this batch; see the rollout README."""
         self._budget = max(0, int(max_outstanding))
-        self._credit = max(0, int(remaining_prompts) - len(self._inflight) - len(self._buffer))
+        self._horizon = max(0, int(remaining_prompts))
+        self._accepted = 0
 
     @property
     def inflight(self) -> int:
@@ -67,13 +69,15 @@ class Producer:
                 self._idle.set()
                 await self._resumed.wait()
                 self._idle.clear()
-            while (
-                self._resumed.is_set() and self._credit > 0 and len(self._inflight) + len(self._buffer) < self._budget
-            ):
+            while self._resumed.is_set():
+                outstanding = len(self._inflight) + len(self._buffer)
+                # The horizon counts accepted deliveries, so a rejected group frees its own
+                # allowance and its replacement can still be admitted.
+                if outstanding >= self._budget or outstanding + self._accepted >= self._horizon:
+                    break
                 prompt = self._pull()
                 if prompt is None:
                     break
-                self._credit -= 1
                 self._inflight.add(asyncio.create_task(self._run_group(prompt)))
             if not self._inflight:
                 await asyncio.sleep(_IDLE_INTERVAL_S)
@@ -112,7 +116,9 @@ class Producer:
                     self._task.result()
                     raise RuntimeError("rollout producer exited without an exception")
                 if get in done:
-                    return get.result()
+                    group = get.result()
+                    self._accepted += 1
+                    return group
                 logger.warning("no completed rollout group for %ss", _NO_PROGRESS_WARN_S)
         finally:
             if not get.done():

@@ -65,7 +65,7 @@ wrong objective.
   trainers. It owns an asyncio loop on its own daemon thread: a producer coroutine
   keeps work outstanding, one task per prompt group with siblings gathered inside it,
   and finished groups land in a FIFO the trainer pulls one at a time. Admission is an
-  occupancy cap plus a consumable credit the trainer recomputes each batch, so the
+  occupancy cap plus a delivery horizon the trainer recomputes each batch, so the
   manager drains empty at an eval, save or final boundary. The manager owns the
   published rollout version; trainers own training progress, publication cadence and
   scoring order. `AgenticTrainer` drives the same manager as a per-step barrier.
@@ -140,10 +140,14 @@ change surface:
 - **Backpressure is the producer's admission, not a blocking `put`** — a blocking `put`
   would deadlock `pause()`, because the drain cannot complete while the producer waits
   for buffer space no one is consuming. Admission has two bounds and they are not
-  interchangeable: an **occupancy cap** (`max_outstanding`) that consumption refills, and
-  a **consumable credit** (`remaining_prompts` less what is already outstanding) that it
-  does not. Only the credit keeps the manager empty at a boundary — an occupancy target
-  alone is refilled by every `get`, so the producer admits straight past the horizon.
+  interchangeable: an **occupancy cap** (`max_outstanding`) bounding concurrent work, and a
+  **delivery horizon** (`remaining_prompts`) bounding how many groups may still be *accepted*
+  before the next boundary. The producer admits while `outstanding < cap` and
+  `outstanding + accepted < horizon`. Only the horizon keeps the manager empty at a boundary —
+  an occupancy target alone is refilled by every `get`, so the producer admits straight past it.
+  The horizon must count **accepted deliveries, not pulls**: a group rejected on get is recycled
+  and never delivered, so spending its allowance would strand the recycled prompt with nothing
+  left to re-admit it and hang the consumer inside `next_group`.
 - **Only the producer coroutine may await `_inflight`** — `pause()` waits on an idle
   event the producer sets, because two coroutines awaiting the same task set would each
   put the same finished group.
