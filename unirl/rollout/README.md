@@ -61,16 +61,15 @@ wrong objective.
   ratio is 1 on the first update; *separate* — a dedicated engine on its own GPUs
   plus a `sync:` block; *colocate* — a dedicated engine sharing GPUs with train,
   plus offload/onload and `sync:`.
-- **Driver-side scheduling.** One `manager.RolloutManager` serves batch and
-  agentic trainers. Its progress thread dispatches bounded work and observes
-  readiness; trainer-thread collection resolves results, assembles agentic
-  siblings, and applies the configured filter. Async batch trainers own training
-  progress and publication cadence; the manager owns the published rollout version
-  and preserves completed generations as FIFO batch chunks. `AgenticTrainer` collects
-  one complete barrier batch per step. Async AR refills the same manager immediately
-  after collection, so its existing progress thread overlaps the next generation
-  with scoring and training. Publication and durable boundaries still quiesce that
-  single manager before proceeding.
+- **Driver-side scheduling.** One `manager.RolloutManager` serves batch and agentic
+  trainers. It owns an asyncio loop on its own daemon thread: a producer coroutine
+  keeps work outstanding, one task per prompt group with siblings gathered inside it,
+  and finished groups land in a FIFO the trainer pulls one at a time. Admission is an
+  occupancy cap plus a delivery horizon the trainer recomputes each batch, so the
+  manager drains empty at an eval, save or final boundary. The manager owns the
+  published rollout version; trainers own training progress, publication cadence and
+  scoring order. `AgenticTrainer` drives the same manager as a per-step barrier.
+  Publication and durable boundaries still settle in-flight work before proceeding.
 
 **Extending it:** a new single-turn engine adds `engine/<name>/config.py` (a
 `BaseEngineConfig` whose `make_engine(**deps)` lazily imports and builds it) and
@@ -120,13 +119,59 @@ change surface:
   exception: its undecorated method is reached through one `Handle.slot(...)`.
 - **Direct sampling forbids a `sync:` block; dedicated requires one.** The trainside
   engine also can't live on a `layout: separate` slab — `_build_rollout` raises.
-- **Quiesce before weight sync / eval / checkpoint on async paths** —
-  `RolloutManager.quiesce()` pauses dispatch, drains batch work, and cooperatively
-  suspends agentic trajectories at turn boundaries. `sync_weights()` rejects queued
-  or in-flight work, pushes weights, and publishes the optimizer-update
-  `output_version`; immutable buffered groups keep their original provenance and
-  remain subject to the configured filter. Eval/checkpoint admission still requires
-  an empty manager. Launch and scoring order remains trainer policy.
+- **`RolloutManager.publish()` is the only weight-publication path on async trainers** —
+  it pauses the producer, settles in-flight groups into the buffer, pushes weights, and
+  resumes. It deliberately has no `try/finally`: a failed weight write leaves the
+  producer paused rather than resuming against half-published weights. Buffered groups
+  survive a publication and stay subject to the get-side filter, so publication no
+  longer batch-aligns anything. Eval/checkpoint boundaries still require an empty
+  manager. Scoring order remains trainer policy.
+- **`weight_sync.sync()` and `set_version()` run on the trainer thread, never the loop
+  thread** — the grad context is a `threading.local`, so a train-slab `@distributed`
+  call made from the manager's loop thread silently loses autograd instead of raising.
+  The loop thread owns the rollout Handle; the trainer thread owns the train slab.
+- **A dead producer surfaces on the next `next_group`, not after its backlog drains** —
+  the consumer races the buffer `get` against the producer task and checks the task
+  first, so a launcher or engine failure fails the step immediately. That race is the
+  whole liveness contract; there is no separate failure flag.
+- **`GroupBuffer.get` must not await between the pop and the return** — a cancelled
+  `get` would lose the popped group. Keep the get-side filter and the recycle callback
+  synchronous.
+- **Backpressure is the producer's admission, not a blocking `put`** — a blocking `put`
+  would deadlock `pause()`, because the drain cannot complete while the producer waits
+  for buffer space no one is consuming. Admission has two bounds and they are not
+  interchangeable: an **occupancy cap** (`max_outstanding`) bounding concurrent work, and a
+  **delivery horizon** (`remaining_prompts`) bounding how many groups may still be *accepted*
+  before the next boundary. The producer admits while `outstanding < cap` and
+  `outstanding + accepted < horizon`. Only the horizon keeps the manager empty at a boundary —
+  an occupancy target alone is refilled by every `get`, so the producer admits straight past it.
+  The horizon must count **accepted deliveries, not pulls**: a group rejected on get is recycled
+  and never delivered, so spending its allowance would strand the recycled prompt with nothing
+  left to re-admit it and hang the consumer inside `next_group`.
+- **`GroupBuffer` books the acceptance, not the consumer** — it increments in the same event-loop
+  turn as the pop, under the condition lock, so `outstanding + accepted` never dips. Booking it in
+  `Producer.next_group` instead leaves a scheduling gap between the pop and the increment, and the
+  producer wakes inside that gap, sees the smaller buffer against the stale count, and admits a
+  replacement for a group it actually kept — over-admitting past the boundary.
+- **Only the producer coroutine may await `_inflight`** — `pause()` waits on an idle
+  event the producer sets, because two coroutines awaiting the same task set would each
+  put the same finished group.
+- **`output_version` is attributed to where generation started, not where it ended** —
+  engines capture the version before calling the backend, so a publication landing
+  mid-generation over-reports staleness by at most the publications it spanned rather
+  than silently claiming the work is fresher than it is. Filters therefore discard
+  more than strictly necessary and never keep off-policy work as on-policy.
+- **A mixed-version batch is attributed to its oldest span, and re-stamped explicitly** —
+  `output_version` is a `shared_field`, so `Batch.concat` resolves it to the first
+  chunk's value; `combine_rollout_prompts` overwrites every gen Part with
+  `min(versions)` afterwards, or the batch would merely *look* single-version to every
+  later reader. Diffusion keeps the single-version rejection, because `sampling_params`
+  is shared the same way and carries the pinned σ/SDE schedule that
+  `engine/sigma_verify.py` guards; `async/version_spread` must be zero there.
+- **Request-level partial rollout is gone** — nothing arms `set_stopping`, so an
+  agentic trajectory always runs to terminal completion and `harness_status ==
+  "suspended"` is unreachable. The engine-side suspension contract is left intact for
+  a future engine-level retract.
 - **A resolve/route failure poisons the `RolloutManager`** — samples may already be
   lost, so every later call (including `empty` / `counts`) re-raises the original
   error rather than reporting clean state; only `close()` stays safe.

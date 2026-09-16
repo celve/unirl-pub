@@ -4,9 +4,9 @@
 > `Sample`. Out: a filled `Sample`, or a trajectory `list[Sample]`.
 > Full map: [`../README.md`](../README.md).
 
-*Two halves of one design: `synchronous.py` holds the worker-side contracts every
-per-backend subpackage implements; `asynchronous.py` holds the driver-side engines
-the async trainers program against.*
+*`synchronous.py` holds the worker-side contracts every per-backend subpackage
+implements; driver-side scheduling lives in [`../manager/`](../manager/), which the
+async trainers program against.*
 
 ## What it is
 
@@ -28,13 +28,10 @@ down: what a worker-side engine must implement, and what the driver may assume.
   including coordinator engines; `SyncRolloutEngine` is the `Sample` → `Sample`
   refinement the per-backend subpackages implement. Engines complete construction
   in `__init__` — there is no separate initialize step.
-- **Driver side** (`asynchronous.py`). Single-threaded, lock-free, ray-free;
-  non-blocking dispatch is `Handle.launch_nowait`. Mechanisms are policy-free —
-  `VersionedBuffer` (payload-agnostic freshness/staleness) and `InflightPool`
-  (non-blocking pool of distributed `generate` calls); launch ceilings, reap/launch
-  ordering and step loops live in the trainers. Both engines share one consumer
-  surface: `poll` / `drain_freshest` / `pop_evicted` / `quiesce` plus an
-  engine-owned `weight_version`.
+- **Driver side** ([`../manager/`](../manager/)). `RolloutManager` owns one asyncio
+  loop thread that produces finished groups into a bounded buffer; per-slot dispatch
+  is `Slot.launch` awaited through `PendingHandleCall.aresult`. The engine owns
+  `_version`, stamped onto a gen Part at the version generation *started* under.
 - **σ round-trip** (`sigma_verify.py`). The adapter pins the gen Part's sigmas via
   `ensure_sample_sigmas`, forwards them, and asserts the worker echoed back the
   exact schedule it sent.

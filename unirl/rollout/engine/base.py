@@ -163,11 +163,11 @@ class BaseRolloutEngine(Remote, ABC):
             raise ValueError(f"train_version must be >= 0, got {train_version}")
         self._version = train_version
 
-    def _stamp_output_version(self, sample: Sample) -> Sample:
-        """Stamp ``self._version`` onto the frontier (last) gen Part."""
+    def _stamp_output_version(self, sample: Sample, version: int) -> Sample:
+        """Stamp the behaviour-policy ``version`` the caller captured before generating onto the frontier gen Part."""
         if not sample.parts:
             return sample
-        gen = sample.parts[-1].fill(output_version=self._version)
+        gen = sample.parts[-1].fill(output_version=version)
         return sample.with_parts([*sample.parts[:-1], gen])
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import queue
 import re
 import time
 from collections import Counter
@@ -14,7 +15,13 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
-from unirl.rollout.manager import RolloutManager, required_worker_concurrency, validate_worker_inflight
+from unirl.rollout.manager import (
+    RolloutManager,
+    keep_regardless,
+    required_worker_concurrency,
+    validate_worker_inflight,
+    well_formed_group,
+)
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import (
     BaseTrainer,
@@ -109,12 +116,15 @@ class AgenticTrainer(BaseTrainer):
                 self._build_colocated_rollout(rollout_cfg, sync_cfg)
 
             slots = self.rollout.engine_slots
-            launchers = [lambda sample, slot=slot: slot.launch("generate", sample) for slot in slots]
+            self._step_prompts: queue.SimpleQueue = queue.SimpleQueue()
             self._rollout_manager = RolloutManager(
                 self.rollout,
-                launchers=launchers,
-                capacities=[self._per_worker_inflight] * len(launchers),
-                group_size=self._group_size,
+                launch=lambda index, sample: slots[index].launch("generate", sample),
+                pull=self._pull_step_prompt,
+                put_filter=well_formed_group(self._group_size),
+                get_filter=keep_regardless,
+                slot_capacities=[self._per_worker_inflight] * len(slots),
+                fanout=self._group_size,
             )
             self._train_version = unwrap_replicated_int(
                 self.backend.get_optimizer_step_count(),
@@ -184,14 +194,22 @@ class AgenticTrainer(BaseTrainer):
             root_control={"ar": {"stop": list(self._stop)}},
         )
 
+    def _pull_step_prompt(self) -> Optional[Sample]:
+        """This step's next prompt, handed across from the trainer thread; None once the step is exhausted."""
+        try:
+            return self._step_prompts.get_nowait()
+        except queue.Empty:
+            return None
+
     def _collect_groups(self, requests: Sample) -> List[List[Sample]]:
         self.rollout.wake_up()
-        self._rollout_manager.sync_weights(self.weight_sync, output_version=self._train_version)
+        self._rollout_manager.publish(self.weight_sync, output_version=self._train_version)
         self.backend.offload()
 
-        tasks = [prompt for prompt in requests.split() for _ in range(self._group_size)]
-        self._rollout_manager.submit(tasks)
-        groups = self._rollout_manager.collect(self.batch_size, current_version=self._train_version)
+        for prompt in requests.split():
+            self._step_prompts.put(prompt)
+        self._rollout_manager.set_admission(max_outstanding=self.batch_size, remaining_prompts=self.batch_size)
+        groups = [self._rollout_manager.next_group(current_version=self._train_version) for _ in range(self.batch_size)]
         if not self._rollout_manager.empty:
             raise RuntimeError("agentic barrier rollout must leave RolloutManager empty")
 

@@ -341,7 +341,8 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         with self._generate_lock:
             if self._shutdown_requested:
                 raise RuntimeError("FastVideoRolloutEngine.generate called after shutdown")
-            return self._stamp_output_version(self._generate_core(sample))
+            version = self._version
+            return self._stamp_output_version(self._generate_core(sample), version)
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Generate and fill the frontier diffusion Part."""

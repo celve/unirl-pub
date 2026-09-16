@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ from unirl.distributed.group.dispatch import (
     Execute,
     resolve_backward_dispatch_mode,
 )
-from unirl.distributed.group.ray_utils import get_actor_results, inspect_ready_actor_results
+from unirl.distributed.group.ray_utils import aget_actor_results, get_actor_results, inspect_ready_actor_results
 from unirl.distributed.group.remote import RankInfo, Remote
 from unirl.distributed.tensor import TensorRef, WorkerLocalTransport, map_tree
 from unirl.distributed.tensor.backend.gpu_store.handle import GPUTensorHandle
@@ -230,7 +231,7 @@ class HandleRef:
 
 
 class PendingHandleCall:
-    """Future-like result of :meth:`Handle.launch_nowait`: launched, not yet collected."""
+    """Future-like result of :meth:`Slot.launch`: launched, not yet collected."""
 
     def __init__(
         self,
@@ -326,6 +327,32 @@ class PendingHandleCall:
         self._consumed = True
         return self._value
 
+    async def aresult(self) -> Any:
+        """Await completion, then rebind + collect: the method's collected return value."""
+        if self._consumed:
+            return self._value
+        handle = self._handle
+        collect_fn = self._collect_fn
+        if collect_fn is None:
+            _, _, collect_fn, _ = handle._method_configs[self._method_name]
+        try:
+            self._value = await handle._aresolve_call(
+                collect_fn,
+                self._refs,
+                worker_local=self._worker_local,
+                targets=self._targets,
+                method_name=self._method_name,
+            )
+        except asyncio.CancelledError:
+            # The actor task outlives a cancelled await, so discard_on_completion still needs the leases.
+            raise
+        except BaseException:
+            self._release_leases()
+            raise
+        self._release_leases()
+        self._consumed = True
+        return self._value
+
     def _release_leases(self) -> None:
         """Release handles owning destination TensorStore entries after RPC consumption."""
         self._leases = None
@@ -381,9 +408,6 @@ class Slot:
             collect_fn=lambda _, results: results[0],
             leases=shards,
         )
-
-    def call(self, method_name: str, *args, **kwargs) -> Any:
-        return self.launch(method_name, *args, **kwargs).result()
 
 
 class Handle:
@@ -717,26 +741,27 @@ class Handle:
         results = [self._rebind_tree(r, workers[i], worker_local=worker_local) for i, r in enumerate(results)]
         return collect_fn(self, results)
 
-    def launch_nowait(self, method_name: str, *args, **kwargs) -> PendingHandleCall:
-        """Launch a @distributed method without blocking: the launch phase of"""
-        try:
-            dispatch_mode, dispatch_fn, _, execute_fn = self._method_configs[method_name]
-        except KeyError:
-            raise AttributeError(
-                f"{method_name!r} is not a @distributed method of {_owning_class(self.role_cls).__name__}"
-            ) from None
-
-        refs, worker_local, leases = self._launch_call(
-            method_name,
-            dispatch_mode,
-            dispatch_fn,
-            execute_fn,
-            args,
-            kwargs,
-            grad_mode=False,
-            call_id=None,
+    async def _aresolve_call(
+        self,
+        collect_fn: Callable,
+        refs: List,
+        *,
+        worker_local: bool,
+        ray_get_timeout: Optional[float] = None,
+        targets: Optional[List[Any]] = None,
+        method_name: str = "call",
+    ):
+        """Resolve a launched call into its collected return value without blocking the calling thread."""
+        results = await aget_actor_results(
+            refs,
+            pool=self.pool,
+            role_name=self.role_name,
+            method_name=method_name,
+            timeout=ray_get_timeout,
         )
-        return PendingHandleCall(self, method_name, refs, worker_local, leases=leases)
+        workers = self.workers if targets is None else targets
+        results = [self._rebind_tree(r, workers[i], worker_local=worker_local) for i, r in enumerate(results)]
+        return collect_fn(self, results)
 
     def _execute_all(self, method_name: str, shards: List, grad_mode: bool = False, call_id=None) -> List:
         """Send RPC to all Workers."""

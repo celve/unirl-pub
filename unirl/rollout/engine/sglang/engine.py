@@ -173,8 +173,8 @@ class SGLangRolloutEngine(BaseRolloutEngine):
                 payload["lora_path"] = active_adapter
         return prepared
 
-    def _finish_generation(self, sample: Sample, prepared: Any, raw: List[Any]) -> Sample:
-        return self._stamp_output_version(self.adapter.build_response(sample, prepared, raw))
+    def _finish_generation(self, sample: Sample, prepared: Any, raw: List[Any], version: int) -> Sample:
+        return self._stamp_output_version(self.adapter.build_response(sample, prepared, raw), version)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
@@ -182,8 +182,9 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         if not self._is_tp_zero:
             return None
         prepared = self._prepare_generation(sample)
+        version = self._version
         raw = self._backend.generate(prepared.wire)
-        return self._finish_generation(sample, prepared, raw)
+        return self._finish_generation(sample, prepared, raw, version)
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Abort in-flight generation (best-effort). Partials surface via the"""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, List, Optional, Sequence
@@ -108,5 +109,53 @@ def get_actor_results(
                 pending=pending,
             )
             raise
+
+    return results
+
+
+async def aget_actor_results(
+    refs: Sequence[Any],
+    *,
+    pool: Any,
+    role_name: str,
+    method_name: str,
+    timeout: Optional[float] = None,
+) -> List[Any]:
+    """Await refs in completion order, returning rank order; poison the pool on the first failure."""
+    ordered_refs = list(refs)
+    if not ordered_refs:
+        return []
+
+    # wrap_future binds to the running loop, so this must be awaited on the loop that owns the caller.
+    rank_by_future = {asyncio.wrap_future(ref.future()): index for index, ref in enumerate(ordered_refs)}
+    ref_by_future = dict(zip(rank_by_future, ordered_refs))
+    results: List[Any] = [None] * len(ordered_refs)
+    pending = set(rank_by_future)
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    while pending:
+        remaining = None if deadline is None else max(deadline - time.monotonic(), 0.0)
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED, timeout=remaining)
+        if not done:
+            for future in pending:
+                future.cancel()
+            raise GetTimeoutError(
+                f"Timed out after {timeout}s waiting for {len(pending)} of "
+                f"{len(ordered_refs)} {role_name}.{method_name} actor tasks"
+            )
+        for future in done:
+            rank = rank_by_future[future]
+            try:
+                results[rank] = future.result()
+            except Exception as error:
+                _poison_and_cancel(
+                    pool=pool,
+                    rank=rank,
+                    role_name=role_name,
+                    method_name=method_name,
+                    error=error,
+                    pending=[ref_by_future[future] for future in pending],
+                )
+                raise
 
     return results
