@@ -119,9 +119,12 @@ class RolloutManager:
         self._ensure_open()
         self._loop.run(self._producer.resume())
 
-    def set_group_budget(self, groups: int) -> None:
+    def set_admission(self, *, max_outstanding: int, remaining_prompts: int) -> None:
+        """Cap concurrent work and spend down the prompts still admissible before the next hard boundary."""
         self._ensure_open()
-        self._producer.budget = groups
+        self._loop.run(
+            self._producer.set_admission(max_outstanding=max_outstanding, remaining_prompts=remaining_prompts)
+        )
 
     def drain_metrics(self) -> dict[str, int]:
         return {**self._buffer.drain_metrics(), "rollout/buffered_groups": len(self._buffer)}

@@ -126,8 +126,8 @@ async def aget_actor_results(
     if not ordered_refs:
         return []
 
-    # as_future binds to the running loop, so this must be awaited on the loop that owns the caller.
-    rank_by_future = {ref.as_future(): index for index, ref in enumerate(ordered_refs)}
+    # wrap_future binds to the running loop, so this must be awaited on the loop that owns the caller.
+    rank_by_future = {asyncio.wrap_future(ref.future()): index for index, ref in enumerate(ordered_refs)}
     ref_by_future = dict(zip(rank_by_future, ordered_refs))
     results: List[Any] = [None] * len(ordered_refs)
     pending = set(rank_by_future)

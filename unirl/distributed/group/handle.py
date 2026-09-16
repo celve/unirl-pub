@@ -334,18 +334,17 @@ class PendingHandleCall:
         collect_fn = self._collect_fn
         if collect_fn is None:
             _, _, collect_fn, _ = handle._method_configs[self._method_name]
-        try:
-            self._value = await handle._aresolve_call(
-                collect_fn,
-                self._refs,
-                worker_local=self._worker_local,
-                targets=self._targets,
-                method_name=self._method_name,
-            )
-        finally:
-            # Latched here rather than after the try, so a failed call is never retried without its leases.
-            self._consumed = True
-            self._release_leases()
+        # No finally: a cancelled or failed call keeps its leases and stays unconsumed, because
+        # cancelling the future does not cancel the actor task and discard_on_completion still needs both.
+        self._value = await handle._aresolve_call(
+            collect_fn,
+            self._refs,
+            worker_local=self._worker_local,
+            targets=self._targets,
+            method_name=self._method_name,
+        )
+        self._release_leases()
+        self._consumed = True
         return self._value
 
     def _release_leases(self) -> None:

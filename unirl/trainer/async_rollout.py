@@ -69,20 +69,19 @@ def next_hard_boundary(
     return boundary
 
 
-def boundary_group_budget(
+def boundary_admission(
     *,
     max_inflight_prompts: int,
     batch_size: int,
     trained_batches: int,
     hard_boundary: int,
-) -> int:
-    """Groups the producer may keep outstanding across flight and buffer, clamped by the next hard boundary."""
+) -> Tuple[int, int]:
+    """Occupancy cap, and the prompts still admissible before the next eval/save/final boundary."""
     if max_inflight_prompts % batch_size:
         raise ValueError(
             f"max_inflight_prompts ({max_inflight_prompts}) must be divisible by batch_size ({batch_size})"
         )
-    remaining_prompts = max(0, hard_boundary - trained_batches) * batch_size
-    return min(max_inflight_prompts, remaining_prompts)
+    return max_inflight_prompts, max(0, hard_boundary - trained_batches) * batch_size
 
 
 def rollout_version_metrics(
@@ -337,7 +336,7 @@ class AsyncRolloutTrainerMixin:
         *,
         hard_boundary: int,
     ) -> Tuple["Sample", int, int]:
-        self._set_group_budget(trained_batches=rollout_id, hard_boundary=hard_boundary)
+        self._set_admission(trained_batches=rollout_id, hard_boundary=hard_boundary)
 
         manager = self._rollout_manager
         groups = [manager.next_group(current_version=self._train_version) for _ in range(self.batch_size)]
@@ -352,27 +351,26 @@ class AsyncRolloutTrainerMixin:
 
         # Consuming a batch releases capacity immediately. Refill before reward
         # for AR and before training for trainers that require reap-time scoring.
-        self._set_group_budget(trained_batches=rollout_id + 1, hard_boundary=hard_boundary)
+        self._set_admission(trained_batches=rollout_id + 1, hard_boundary=hard_boundary)
 
         if scored is None:
             scored = self._score_completed(rollout_id, completed)
 
         return scored, output_version, version_spread
 
-    def _set_group_budget(self, *, trained_batches: int, hard_boundary: int) -> None:
-        self._rollout_manager.set_group_budget(
-            boundary_group_budget(
-                max_inflight_prompts=self._max_inflight_prompts,
-                batch_size=self.batch_size,
-                trained_batches=trained_batches,
-                hard_boundary=hard_boundary,
-            )
+    def _set_admission(self, *, trained_batches: int, hard_boundary: int) -> None:
+        max_outstanding, remaining_prompts = boundary_admission(
+            max_inflight_prompts=self._max_inflight_prompts,
+            batch_size=self.batch_size,
+            trained_batches=trained_batches,
+            hard_boundary=hard_boundary,
         )
+        self._rollout_manager.set_admission(max_outstanding=max_outstanding, remaining_prompts=remaining_prompts)
 
 
 __all__ = [
     "AsyncRolloutTrainerMixin",
-    "boundary_group_budget",
+    "boundary_admission",
     "combine_rollout_prompts",
     "next_hard_boundary",
     "resolve_separate_worker_concurrency",

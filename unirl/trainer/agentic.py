@@ -208,7 +208,7 @@ class AgenticTrainer(BaseTrainer):
 
         for prompt in requests.split():
             self._step_prompts.put(prompt)
-        self._rollout_manager.set_group_budget(self.batch_size)
+        self._rollout_manager.set_admission(max_outstanding=self.batch_size, remaining_prompts=self.batch_size)
         groups = [self._rollout_manager.next_group(current_version=self._train_version) for _ in range(self.batch_size)]
         if not self._rollout_manager.empty:
             raise RuntimeError("agentic barrier rollout must leave RolloutManager empty")

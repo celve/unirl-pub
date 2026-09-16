@@ -45,7 +45,8 @@ def well_formed_group(group_size: int) -> PutFilter:
         if len(roots) != 1:
             raise RuntimeError(f"rollout group must carry exactly one root; got {sorted(roots)}")
         for sample in group:
-            if not sample.gen_parts():
+            # A failed agentic trajectory legitimately carries no gen Parts; the trainer drops it at scoring.
+            if sample.parts[-1].harness_status is None and not sample.gen_parts():
                 raise RuntimeError("completed rollout has no generated Parts")
             unstamped = [index for index, part in enumerate(sample.gen_parts()) if part.output_version is None]
             if unstamped:

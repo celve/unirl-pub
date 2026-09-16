@@ -37,6 +37,7 @@ class Producer:
         if self._fanout <= 0:
             raise ValueError(f"fanout must be positive; got {fanout}")
         self._budget = 0
+        self._credit = 0
         self._inflight: Set[asyncio.Task] = set()
         self._pending: Set[Any] = set()
         self._resumed = asyncio.Event()
@@ -50,18 +51,14 @@ class Producer:
             raise ValueError("rollout producer needs at least one slot of capacity")
         self._task = asyncio.create_task(self._run(), name="rollout-producer")
 
-    @property
-    def budget(self) -> int:
-        return self._budget
-
-    @budget.setter
-    def budget(self, groups: int) -> None:
-        # Written from the trainer thread; the loop re-reads it each pass, so a raise takes
-        # effect after at most one idle interval.
-        self._budget = max(0, int(groups))
+    async def set_admission(self, *, max_outstanding: int, remaining_prompts: int) -> None:
+        """Set the occupancy cap and recompute the admission credit; see the rollout README."""
+        self._budget = max(0, int(max_outstanding))
+        self._credit = max(0, int(remaining_prompts) - len(self._inflight) - len(self._buffer))
 
     @property
     def inflight(self) -> int:
+        self._raise_if_dead()
         return len(self._inflight)
 
     async def _run(self) -> None:
@@ -70,10 +67,13 @@ class Producer:
                 self._idle.set()
                 await self._resumed.wait()
                 self._idle.clear()
-            while self._resumed.is_set() and len(self._inflight) + len(self._buffer) < self._budget:
+            while (
+                self._resumed.is_set() and self._credit > 0 and len(self._inflight) + len(self._buffer) < self._budget
+            ):
                 prompt = self._pull()
                 if prompt is None:
                     break
+                self._credit -= 1
                 self._inflight.add(asyncio.create_task(self._run_group(prompt)))
             if not self._inflight:
                 await asyncio.sleep(_IDLE_INTERVAL_S)
@@ -149,7 +149,7 @@ class Producer:
             pending.discard_on_completion()
 
     def _raise_if_dead(self) -> None:
-        if self._task.done():
+        if self._task.done() and not self._task.cancelled():
             self._task.result()
             raise RuntimeError("rollout producer exited without an exception")
 

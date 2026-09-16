@@ -61,16 +61,15 @@ wrong objective.
   ratio is 1 on the first update; *separate* — a dedicated engine on its own GPUs
   plus a `sync:` block; *colocate* — a dedicated engine sharing GPUs with train,
   plus offload/onload and `sync:`.
-- **Driver-side scheduling.** One `manager.RolloutManager` serves batch and
-  agentic trainers. Its progress thread dispatches bounded work and observes
-  readiness; trainer-thread collection resolves results, assembles agentic
-  siblings, and applies the configured filter. Async batch trainers own training
-  progress and publication cadence; the manager owns the published rollout version
-  and preserves completed generations as FIFO batch chunks. `AgenticTrainer` collects
-  one complete barrier batch per step. Async AR refills the same manager immediately
-  after collection, so its existing progress thread overlaps the next generation
-  with scoring and training. Publication and durable boundaries still quiesce that
-  single manager before proceeding.
+- **Driver-side scheduling.** One `manager.RolloutManager` serves batch and agentic
+  trainers. It owns an asyncio loop on its own daemon thread: a producer coroutine
+  keeps work outstanding, one task per prompt group with siblings gathered inside it,
+  and finished groups land in a FIFO the trainer pulls one at a time. Admission is an
+  occupancy cap plus a consumable credit the trainer recomputes each batch, so the
+  manager drains empty at an eval, save or final boundary. The manager owns the
+  published rollout version; trainers own training progress, publication cadence and
+  scoring order. `AgenticTrainer` drives the same manager as a per-step barrier.
+  Publication and durable boundaries still settle in-flight work before proceeding.
 
 **Extending it:** a new single-turn engine adds `engine/<name>/config.py` (a
 `BaseEngineConfig` whose `make_engine(**deps)` lazily imports and builds it) and
@@ -138,11 +137,13 @@ change surface:
 - **`GroupBuffer.get` must not await between the pop and the return** — a cancelled
   `get` would lose the popped group. Keep the get-side filter and the recycle callback
   synchronous.
-- **Backpressure is the producer's budget, not a blocking `put`** — the producer pulls
-  only while `in-flight + buffered < budget`, and the trainer recomputes that budget each
-  batch, so the buffer depth is bounded by construction. A blocking `put` would be a
-  second, redundant mechanism and would deadlock `pause()`: the drain cannot complete
-  while the producer waits for buffer space no one is consuming.
+- **Backpressure is the producer's admission, not a blocking `put`** — a blocking `put`
+  would deadlock `pause()`, because the drain cannot complete while the producer waits
+  for buffer space no one is consuming. Admission has two bounds and they are not
+  interchangeable: an **occupancy cap** (`max_outstanding`) that consumption refills, and
+  a **consumable credit** (`remaining_prompts` less what is already outstanding) that it
+  does not. Only the credit keeps the manager empty at a boundary — an occupancy target
+  alone is refilled by every `get`, so the producer admits straight past the horizon.
 - **Only the producer coroutine may await `_inflight`** — `pause()` waits on an idle
   event the producer sets, because two coroutines awaiting the same task set would each
   put the same finished group.
